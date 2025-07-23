@@ -29,6 +29,9 @@
 #include <smb2/libsmb2.h>
 #include <smb2/libsmb2-raw.h>
 
+#include <dos/dostags.h>
+#include <dos/dos.h>
+
 #define DEFAULT_OUTPUT_BUFFER_LENGTH 0xffff
 
 struct pollfd {
@@ -313,7 +316,26 @@ static int wait_for_reply(struct smb2_context *smb2, struct sync_cb_data *cb_dat
 		{
 			continue;
 		}
-		if (smb2_service(smb2, pfd.revents) < 0)
+		// Implement retry logic for transient ETIMEDOUT errors
+		int retries = 3;
+		int ret;
+		do {
+			ret = smb2_service(smb2, pfd.revents);
+			if (ret < 0) {
+				const char *error = smb2_get_error(smb2);
+				// Check if error contains timeout-related messages
+				if (error && (strstr(error, "timeout") || strstr(error, "ETIMEDOUT") || strstr(error, "errno:60"))) {
+					// Transient timeout - retry immediately
+					// (No delay needed since main timeout fix prevents most issues)
+				} else {
+					break; // Non-timeout error, don't retry
+				}
+			} else {
+				break; // Success
+			}
+		} while (--retries > 0);
+		
+		if (ret < 0)
 		{
 			smb2_set_error(smb2, "smb2_service failed with : %s\n", smb2_get_error(smb2));
 			return -1;
@@ -392,4 +414,3 @@ int smb2_utimens(struct smb2_context *smb2, const char *path, const struct times
 	free(cb_data);
 	return status;
 }
-
