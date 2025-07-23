@@ -210,7 +210,7 @@ static void *smb2fs_init(struct fuse_conn_info *fci)
 	// Configure timeout to prevent errno:60 timeouts during large uploads.
 	// Default 250ms timeout is too aggressive for Samba server delays.
 	// Disable libsmb2 timeout entirely for stable large file transfers.
-	smb2_set_timeout(fsd->smb2, 0);
+	smb2_set_timeout(fsd->smb2, 0);  // Returns void, no error checking needed
 	
 	// Alternative: Use very large timeout (2 minutes) instead of disabling
 	// smb2_set_timeout(fsd->smb2, 120000);

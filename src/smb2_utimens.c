@@ -361,6 +361,7 @@ int smb2_utimens(struct smb2_context *smb2, const char *path, const struct times
 
 	if (send_compound_stat(smb2, path, generic_status_cb, cb_data) != SMB2_STATUS_SUCCESS)
 	{
+		free(cb_data);
 		return -1;
 	}
 
@@ -368,6 +369,7 @@ int smb2_utimens(struct smb2_context *smb2, const char *path, const struct times
 	if (rc < 0)
 	{
 		cb_data->status = SMB2_STATUS_CANCELLED;
+		free(cb_data);
 		return -1;
 	}
 
@@ -400,6 +402,7 @@ int smb2_utimens(struct smb2_context *smb2, const char *path, const struct times
 
 	if (send_compound_set(smb2, path, &fbi, generic_status_cb, cb_data) != SMB2_STATUS_SUCCESS)
 	{
+		free(cb_data);
 		return -1;
 	}
 
