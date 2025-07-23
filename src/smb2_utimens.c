@@ -307,7 +307,7 @@ static int wait_for_reply(struct smb2_context *smb2, struct sync_cb_data *cb_dat
 		pfd.fd = smb2_get_fd(smb2);
 		pfd.events = smb2_which_events(smb2);
 
-		if (poll(&pfd, 1, 1000) < 0)
+		if (poll(&pfd, 1, 5000) < 0)  // Increased from 1000ms to 5000ms for heavy load resilience
 		{
 			smb2_set_error(smb2, "Poll failed");
 			return -1;

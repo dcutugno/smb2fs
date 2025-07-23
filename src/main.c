@@ -1090,6 +1090,15 @@ static int smb2fs_write(const char *path, const char *buffer, size_t size,
 					return -EIO;
 				}
 			}
+			else if (rc > 0)
+			{
+				// Drain any incoming PDUs (credits, ACKs) to prevent flow-control starvation
+				// Process server responses immediately after each successful write chunk
+				int serv;
+				do {
+					serv = smb2_service(fsd->smb2, 0);  // Non-blocking service call
+				} while (serv > 0);  // Continue until no more PDUs to process
+			}
 
 			result += rc;
 			buffer_ref += rc;
