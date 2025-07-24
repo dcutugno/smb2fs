@@ -1090,31 +1090,8 @@ static int smb2fs_write(const char *path, const char *buffer, size_t size,
 			if (count > chunk_size)
 				count = chunk_size;
 			
-			// Proactively check if socket is ready for writing to prevent blocking
-			// This prevents starving wifipi.device's PacketReceiver/UnitTask
-			int sock_fd = smb2_get_fd(fsd->smb2);
-			if (sock_fd >= 0) {
-				fd_set wfds;
-				FD_ZERO(&wfds);
-				FD_SET(sock_fd, &wfds);
-				
-				// Use zero timeout for non-blocking check
-				struct timeval timeout;
-				timeout.tv_sec = 0;
-				timeout.tv_usec = 0;
-				ULONG sigmask;
-				int ready = WaitSelect(sock_fd + 1, NULL, &wfds, NULL, &timeout, &sigmask);
-				
-				// If socket not ready, yield CPU and wait for writability
-				if (ready == 0) {
-					KPrintF((STRPTR)"Socket not ready, yielding CPU...\n");
-					WaitSelect(sock_fd + 1, NULL, &wfds, NULL, NULL, &sigmask);
-				}
-			}
-			
-			KPrintF((STRPTR)"SMB2_WRITE: want %lu bytes @%p (chunk_size=%lu)\n", count, buffer_ref, chunk_size);
+			// Perform write - socket is non-blocking so won't hang driver
 			rc = smb2_write(fsd->smb2, smb2fh, (const uint8_t *)buffer_ref, count);
-			KPrintF((STRPTR)" → wrote %ld bytes\n", rc);
 			
 			if (rc < 0)
 			{
@@ -1128,8 +1105,18 @@ static int smb2fs_write(const char *path, const char *buffer, size_t size,
 					
 					// Reset success counter
 					success_count = 0;
-					KPrintF((STRPTR)"EAGAIN detected, backing off chunk_size to %lu\n", chunk_size);
-					continue;  // Retry with smaller chunk immediately
+					
+					// NOW use WaitSelect() - only when we actually have backpressure
+					int sock_fd = smb2_get_fd(fsd->smb2);
+					if (sock_fd >= 0) {
+						fd_set wfds;
+						FD_ZERO(&wfds);
+						FD_SET(sock_fd, &wfds);
+						
+						ULONG sigmask;
+						WaitSelect(sock_fd + 1, NULL, &wfds, NULL, NULL, &sigmask);
+					}
+					continue;  // Retry with smaller chunk
 				}
 				
 				// Connection fault - try to recover
@@ -1149,11 +1136,23 @@ static int smb2fs_write(const char *path, const char *buffer, size_t size,
 			}
 			else if (rc > 0)
 			{
-				// Successful write - process server responses
-				int serv;
-				do {
-					serv = smb2_service(fsd->smb2, 0);
-				} while (serv > 0);
+				// Successful write - batch service calls for pipelining
+				// Only service every 8 chunks or 512KB to maintain throughput
+				static size_t service_counter = 0;
+				static size_t bytes_since_service = 0;
+				
+				service_counter++;
+				bytes_since_service += rc;
+				
+				// Service every 8 chunks OR every 512KB, whichever comes first
+				if (service_counter >= 8 || bytes_since_service >= 524288) {
+					int serv;
+					do {
+						serv = smb2_service(fsd->smb2, 0);
+					} while (serv > 0);
+					service_counter = 0;
+					bytes_since_service = 0;
+				}
 				
 				// Increment success counter and potentially grow chunk size
 				success_count++;
