@@ -1083,6 +1083,13 @@ static int smb2fs_write(const char *path, const char *buffer, size_t size,
 		
 		size_t success_count = 0;
 		result = 0;
+		
+		// Batching counters for smb2_service() calls
+		// Reset at start of each write operation to prevent cross-write persistence
+		static size_t service_counter = 0;
+		static size_t bytes_since_service = 0;
+		service_counter = 0;
+		bytes_since_service = 0;
 
 		while (size > 0)
 		{
@@ -1133,16 +1140,13 @@ static int smb2fs_write(const char *path, const char *buffer, size_t size,
 			}
 			else if (rc > 0)
 			{
-				// Successful write - batch service calls for pipelining
-				// Only service every 8 chunks or 512KB to maintain throughput
-				static size_t service_counter = 0;
-				static size_t bytes_since_service = 0;
+				// Successful write - conservative batching to prevent credit exhaustion
 				
 				service_counter++;
 				bytes_since_service += rc;
 				
-				// Service every 8 chunks OR every 512KB, whichever comes first
-				if (service_counter >= 8 || bytes_since_service >= 524288) {
+				// Service every 4 chunks OR every 256KB to prevent stalls
+				if (service_counter >= 4 || bytes_since_service >= 262144) {
 					int serv;
 					do {
 						serv = smb2_service(fsd->smb2, 0);
@@ -1166,6 +1170,14 @@ static int smb2fs_write(const char *path, const char *buffer, size_t size,
 			buffer_ref += rc;
 			size   -= rc;
 		}
+		
+		// CRITICAL: Final service drain after write loop completion
+		// This ensures all server responses are processed and prevents disconnects
+		int final_serv;
+		do {
+			final_serv = smb2_service(fsd->smb2, 0);
+		} while (final_serv > 0);
+		
 	} while(rc < 0);
 
 	return result;
