@@ -33,6 +33,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <fcntl.h>
 #include <proto/bsdsocket.h>
 
 #include <smb2/smb2.h>
@@ -215,6 +216,17 @@ static void *smb2fs_init(struct fuse_conn_info *fci)
 	// Default 250ms timeout is too aggressive for Samba server delays.
 	// Disable libsmb2 timeout entirely for stable large file transfers.
 	smb2_set_timeout(fsd->smb2, 0);  // Returns void, no error checking needed
+	
+	// Set socket to non-blocking mode to prevent blocking writes that starve
+	// wifipi.device's PacketReceiver and UnitTask, avoiding TCP session timeouts
+	int sock_fd = smb2_get_fd(fsd->smb2);
+	if (sock_fd >= 0) {
+		int flags = fcntl(sock_fd, F_GETFL, 0);
+		if (flags >= 0) {
+			fcntl(sock_fd, F_SETFL, flags | O_NONBLOCK);
+			KPrintF((STRPTR)"SMB2 socket set to non-blocking mode (fd=%ld)\n", (LONG)sock_fd);
+		}
+	}
 	
 	// Alternative: Use very large timeout (2 minutes) instead of disabling
 	// smb2_set_timeout(fsd->smb2, 120000);
@@ -1077,17 +1089,34 @@ static int smb2fs_write(const char *path, const char *buffer, size_t size,
 			count = size;
 			if (count > chunk_size)
 				count = chunk_size;
-
+			
+			// Proactively check if socket is ready for writing to prevent blocking
+			// This prevents starving wifipi.device's PacketReceiver/UnitTask
+			int sock_fd = smb2_get_fd(fsd->smb2);
+			if (sock_fd >= 0) {
+				fd_set wfds;
+				FD_ZERO(&wfds);
+				FD_SET(sock_fd, &wfds);
+				
+				// Use zero timeout for non-blocking check
+				struct timeval timeout;
+				timeout.tv_sec = 0;
+				timeout.tv_usec = 0;
+				ULONG sigmask;
+				int ready = WaitSelect(sock_fd + 1, NULL, &wfds, NULL, &timeout, &sigmask);
+				
+				// If socket not ready, yield CPU and wait for writability
+				if (ready == 0) {
+					KPrintF((STRPTR)"Socket not ready, yielding CPU...\n");
+					WaitSelect(sock_fd + 1, NULL, &wfds, NULL, NULL, &sigmask);
+				}
+			}
+			
+			KPrintF((STRPTR)"SMB2_WRITE: want %lu bytes @%p (chunk_size=%lu)\n", count, buffer_ref, chunk_size);
 			rc = smb2_write(fsd->smb2, smb2fh, (const uint8_t *)buffer_ref, count);
-			if (rc == 0)
-			{
-				break;
-			}
-			else if(rc < -1)
-			{
-				return rc;
-			}
-			else if (rc < 0)
+			KPrintF((STRPTR)" → wrote %ld bytes\n", rc);
+			
+			if (rc < 0)
 			{
 				// Check for EAGAIN (network congestion/queue full)
 				const char *error = smb2_get_error(fsd->smb2);
@@ -1099,19 +1128,8 @@ static int smb2fs_write(const char *path, const char *buffer, size_t size,
 					
 					// Reset success counter
 					success_count = 0;
-					
-					// Use AmigaOS-native WaitSelect() for proper backpressure
-					// Block until socket is writable (no busy-waiting)
-					int sock_fd = smb2_get_fd(fsd->smb2);
-					if (sock_fd >= 0) {
-						fd_set wfds;
-						FD_ZERO(&wfds);
-						FD_SET(sock_fd, &wfds);
-						
-						ULONG sigmask;
-						WaitSelect(sock_fd + 1, NULL, &wfds, NULL, NULL, &sigmask);
-					}
-					continue;  // Retry with smaller chunk
+					KPrintF((STRPTR)"EAGAIN detected, backing off chunk_size to %lu\n", chunk_size);
+					continue;  // Retry with smaller chunk immediately
 				}
 				
 				// Connection fault - try to recover
