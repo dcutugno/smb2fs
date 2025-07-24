@@ -30,6 +30,10 @@
 #include <clib/debug_protos.h>
 #endif
 #include <stdint.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <proto/bsdsocket.h>
 
 #include <smb2/smb2.h>
 #include <smb2/libsmb2.h>
@@ -1096,8 +1100,17 @@ static int smb2fs_write(const char *path, const char *buffer, size_t size,
 					// Reset success counter
 					success_count = 0;
 					
-					// Brief delay to let network driver catch up
-					Delay(1);
+					// Use AmigaOS-native WaitSelect() for proper backpressure
+					// Block until socket is writable (no busy-waiting)
+					int sock_fd = smb2_get_fd(fsd->smb2);
+					if (sock_fd >= 0) {
+						fd_set wfds;
+						FD_ZERO(&wfds);
+						FD_SET(sock_fd, &wfds);
+						
+						ULONG sigmask;
+						WaitSelect(sock_fd + 1, NULL, &wfds, NULL, NULL, &sigmask);
+					}
 					continue;  // Retry with smaller chunk
 				}
 				
