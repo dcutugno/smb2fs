@@ -1054,15 +1054,25 @@ static int smb2fs_write(const char *path, const char *buffer, size_t size,
 			return (int)new_offset;
 		}
 
+		// Adaptive chunk sizing for optimal throughput
+		// Start with 64KB, halve on EAGAIN, grow on success
+		const size_t INITIAL_CHUNK = 65536;    // 64 KiB
+		const size_t MTU_SIZE = 1460;          // MTU minus headers
+		const size_t SUCCESS_THRESHOLD = 3;    // Successes before growing
+		
 		max_write_size = smb2_get_max_write_size(fsd->smb2);
-		//IExec->DebugPrintF("max_write_size: %lu\n", max_write_size);
+		size_t chunk_size = INITIAL_CHUNK;
+		if (chunk_size > max_write_size)
+			chunk_size = max_write_size;
+		
+		size_t success_count = 0;
 		result = 0;
 
 		while (size > 0)
 		{
 			count = size;
-			if (count > max_write_size)
-				count = max_write_size;
+			if (count > chunk_size)
+				count = chunk_size;
 
 			rc = smb2_write(fsd->smb2, smb2fh, (const uint8_t *)buffer_ref, count);
 			if (rc == 0)
@@ -1075,6 +1085,23 @@ static int smb2fs_write(const char *path, const char *buffer, size_t size,
 			}
 			else if (rc < 0)
 			{
+				// Check for EAGAIN (network congestion/queue full)
+				const char *error = smb2_get_error(fsd->smb2);
+				if (error && (strstr(error, "EAGAIN") || strstr(error, "would block") || strstr(error, "try again"))) {
+					// Back off chunk size by half, minimum MTU size
+					chunk_size = chunk_size / 2;
+					if (chunk_size < MTU_SIZE)
+						chunk_size = MTU_SIZE;
+					
+					// Reset success counter
+					success_count = 0;
+					
+					// Brief delay to let network driver catch up
+					Delay(1);
+					continue;  // Retry with smaller chunk
+				}
+				
+				// Connection fault - try to recover
 				if(!handle_connection_fault())
 					return -ENODEV;
 
@@ -1086,18 +1113,26 @@ static int smb2fs_write(const char *path, const char *buffer, size_t size,
 				}
 				else
 				{
-					/* even if connection has reestablished, we do not have a handle recovery for now and need to fail the op */
 					return -EIO;
 				}
 			}
 			else if (rc > 0)
 			{
-				// Drain any incoming PDUs (credits, ACKs) to prevent flow-control starvation
-				// Process server responses immediately after each successful write chunk
+				// Successful write - process server responses
 				int serv;
 				do {
-					serv = smb2_service(fsd->smb2, 0);  // Non-blocking service call
-				} while (serv > 0);  // Continue until no more PDUs to process
+					serv = smb2_service(fsd->smb2, 0);
+				} while (serv > 0);
+				
+				// Increment success counter and potentially grow chunk size
+				success_count++;
+				if (success_count >= SUCCESS_THRESHOLD) {
+					// Double chunk size, capped by max_write_size
+					chunk_size = chunk_size * 2;
+					if (chunk_size > max_write_size)
+						chunk_size = max_write_size;
+					success_count = 0;
+				}
 			}
 
 			result += rc;
