@@ -1090,33 +1090,30 @@ static int smb2fs_write(const char *path, const char *buffer, size_t size,
 			if (count > chunk_size)
 				count = chunk_size;
 			
-			// Perform write - socket is non-blocking so won't hang driver
+			// Direct write - socket is non-blocking, no pre-polling
 			rc = smb2_write(fsd->smb2, smb2fh, (const uint8_t *)buffer_ref, count);
 			
 			if (rc < 0)
 			{
-				// Check for EAGAIN (network congestion/queue full)
+				// Check for EAGAIN/EWOULDBLOCK (backpressure)
 				const char *error = smb2_get_error(fsd->smb2);
 				if (error && (strstr(error, "EAGAIN") || strstr(error, "would block") || strstr(error, "try again"))) {
-					// Back off chunk size by half, minimum MTU size
+					// Adaptive backoff
 					chunk_size = chunk_size / 2;
 					if (chunk_size < MTU_SIZE)
 						chunk_size = MTU_SIZE;
-					
-					// Reset success counter
 					success_count = 0;
 					
-					// NOW use WaitSelect() - only when we actually have backpressure
+					// Wait for socket writability - only when actually needed
 					int sock_fd = smb2_get_fd(fsd->smb2);
 					if (sock_fd >= 0) {
 						fd_set wfds;
 						FD_ZERO(&wfds);
 						FD_SET(sock_fd, &wfds);
-						
 						ULONG sigmask;
 						WaitSelect(sock_fd + 1, NULL, &wfds, NULL, NULL, &sigmask);
 					}
-					continue;  // Retry with smaller chunk
+					continue;
 				}
 				
 				// Connection fault - try to recover
