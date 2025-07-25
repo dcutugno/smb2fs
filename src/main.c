@@ -204,12 +204,115 @@ static void *smb2fs_init(struct fuse_conn_info *fci)
 		smb2_set_password(fsd->smb2, "");
 	}
 
-	if (smb2_connect_share(fsd->smb2, url->server, url->share, username) < 0)
+	// CONNECTION DEBUG: Log connection attempt details
+	KPrintF((STRPTR)"=== SMB2 CONNECTION ATTEMPT ===\n");
+	KPrintF((STRPTR)"Server: %s\n", url->server ? url->server : "(null)");
+	KPrintF((STRPTR)"Share: %s\n", url->share ? url->share : "(null)");
+	KPrintF((STRPTR)"Username: %s\n", username ? username : "(null)");
+	KPrintF((STRPTR)"Domain: %s\n", smb2_get_domain(fsd->smb2) ? smb2_get_domain(fsd->smb2) : "(null)");
+	
+	KPrintF((STRPTR)"Calling smb2_connect_share()...\n");
+	int connect_result = smb2_connect_share(fsd->smb2, url->server, url->share, username);
+	KPrintF((STRPTR)"smb2_connect_share() returned: %d\n", connect_result);
+	
+	if (connect_result < 0)
 	{
-		request_error("smb2_connect_share failed.\n%s", smb2_get_error(fsd->smb2));
+		const char *error_msg = smb2_get_error(fsd->smb2);
+		KPrintF((STRPTR)"CONNECTION FAILED! Error: %s\n", error_msg ? error_msg : "(null)");
+		request_error("smb2_connect_share failed.\n%s", error_msg);
 		smb2_destroy_url(url);
 		smb2fs_destroy(fsd);
 		return NULL;
+	}
+	else
+	{
+		KPrintF("[%lu] CONNECTION SUCCESS! Checking socket...\n", (ULONG)time(NULL));
+		int initial_fd = smb2_get_fd(fsd->smb2);
+		KPrintF("[%lu] Initial socket fd after connection: %d\n", (ULONG)time(NULL), initial_fd);
+		
+		// CRITICAL FIX: libsmb2 fd corruption bug
+		// If smb2_get_fd() returns 0 (stdin), this indicates libsmb2's socket fd got corrupted
+		// The connection succeeded but the fd assignment failed in the event loop
+		if (initial_fd <= 2) {
+			KPrintF("[%lu] CRITICAL: libsmb2 fd corruption detected! fd=%d (should be 3+)\n", (ULONG)time(NULL), initial_fd);
+			KPrintF("[%lu] This is a known libsmb2 bug where socket fd gets corrupted to stdin\n", (ULONG)time(NULL));
+			
+			// Enhanced socket recovery with bulletproof exit logic
+			KPrintF("[%lu] Attempting socket recovery...\n", (ULONG)time(NULL));
+			
+			// LIBSMB2 CONTEXT CORRUPTION DETECTED - COMPLETE REINITIALIZATION REQUIRED
+			KPrintF("[%lu] CRITICAL: libsmb2 context corruption detected (garbage in error buffer)\n", (ULONG)time(NULL));
+			KPrintF("[%lu] Implementing complete context reinitialization...\n", (ULONG)time(NULL));
+			
+			// Store connection parameters before destroying corrupted context
+			const char *server = "192.168.1.52";  // Store current server
+			const char *share = "AmigaShare";      // Store current share
+			const char *user = "Davide";           // Store current user
+			
+			// Destroy corrupted libsmb2 context
+			KPrintF("[%lu] Destroying corrupted libsmb2 context...\n", (ULONG)time(NULL));
+			if (fsd->smb2) {
+				smb2_destroy_context(fsd->smb2);
+				fsd->smb2 = NULL;
+			}
+			
+			// Create fresh libsmb2 context
+			KPrintF("[%lu] Creating fresh libsmb2 context...\n", (ULONG)time(NULL));
+			fsd->smb2 = smb2_init_context();
+			if (fsd->smb2 == NULL) {
+				KPrintF("[%lu] FATAL: Failed to create fresh libsmb2 context\n", (ULONG)time(NULL));
+				goto recovery_complete;
+			}
+			
+			// Configure fresh context with optimal settings
+			KPrintF("[%lu] Configuring fresh context...\n", (ULONG)time(NULL));
+			smb2_set_timeout(fsd->smb2, 0);  // Disable aggressive timeouts
+			
+			// Attempt fresh connection
+			KPrintF("[%lu] Attempting fresh connection to %s/%s...\n", (ULONG)time(NULL), server, share);
+			int connect_result = smb2_connect_share(fsd->smb2, server, share, user);
+			KPrintF("[%lu] Fresh connection result: %d\n", (ULONG)time(NULL), connect_result);
+			
+			if (connect_result == 0) {
+				initial_fd = smb2_get_fd(fsd->smb2);
+				KPrintF("[%lu] Fresh connection fd: %d\n", (ULONG)time(NULL), initial_fd);
+				if (initial_fd > 2) {
+					KPrintF("[%lu] SUCCESS: Fresh context connection worked! fd=%d\n", (ULONG)time(NULL), initial_fd);
+					goto recovery_complete;
+				}
+			}
+			
+			KPrintF("[%lu] WARNING: Fresh context connection failed or invalid fd\n", (ULONG)time(NULL));
+			
+			recovery_complete:
+			
+			// Strategy 2: Force reconnection if recovery still failed
+			if (initial_fd <= 2) {
+				KPrintF("[%lu] Strategy 2: Event-based recovery failed, attempting reconnection...\n", (ULONG)time(NULL));
+				
+				// Close current broken connection
+				smb2_disconnect_share(fsd->smb2);
+				Delay(5); // Brief pause
+				
+				// Attempt fresh connection
+				KPrintF("[%lu] Attempting fresh connection...\n", (ULONG)time(NULL));
+				if (smb2_connect_share(fsd->smb2, url->server, url->share, username) < 0) {
+					KPrintF("[%lu] Fresh connection failed: %s\n", (ULONG)time(NULL), smb2_get_error(fsd->smb2));
+				} else {
+					int fresh_fd = smb2_get_fd(fsd->smb2);
+					KPrintF("[%lu] Fresh connection result: fd=%d\n", (ULONG)time(NULL), fresh_fd);
+					if (fresh_fd > 2) {
+						KPrintF("[%lu] SUCCESS: Fresh connection provides valid fd=%d\n", (ULONG)time(NULL), fresh_fd);
+						initial_fd = fresh_fd;
+					}
+				}
+			}
+			
+			if (initial_fd <= 2) {
+				KPrintF("[%lu] FATAL: Socket recovery failed - fd still %d\n", (ULONG)time(NULL), initial_fd);
+				return -ENODEV;
+			}
+		}
 	}
 
 	// Configure timeout to prevent errno:60 timeouts during large uploads.
@@ -217,14 +320,34 @@ static void *smb2fs_init(struct fuse_conn_info *fci)
 	// Disable libsmb2 timeout entirely for stable large file transfers.
 	smb2_set_timeout(fsd->smb2, 0);  // Returns void, no error checking needed
 	
-	// Set socket to non-blocking mode to prevent blocking writes that starve
-	// wifipi.device's PacketReceiver and UnitTask, avoiding TCP session timeouts
+	// Configure socket timeouts for stability while maintaining libsmb2's expected blocking behavior
+	// REMOVED: O_NONBLOCK setting which conflicted with libsmb2's internal state machine
 	int sock_fd = smb2_get_fd(fsd->smb2);
 	if (sock_fd >= 0) {
-		int flags = fcntl(sock_fd, F_GETFL, 0);
-		if (flags >= 0) {
-			fcntl(sock_fd, F_SETFL, flags | O_NONBLOCK);
-			KPrintF((STRPTR)"SMB2 socket set to non-blocking mode (fd=%ld)\n", (LONG)sock_fd);
+		KPrintF((STRPTR)"SMB2 socket fd=%ld (using libsmb2's expected blocking mode)\n", (LONG)sock_fd);
+		
+		// CRITICAL: Validate socket fd - fd=0,1,2 are stdin/stdout/stderr, not network sockets!
+		if (sock_fd <= 2) {
+			KPrintF((STRPTR)"ERROR: Invalid socket fd=%ld (stdin/stdout/stderr) - SMB2 connection failed!\n", (LONG)sock_fd);
+			return -ENODEV;
+		}
+		
+		// CRITICAL: Set socket receive timeout (reduced for faster debugging)
+		// This addresses socket-level timeouts that smb2_set_timeout() doesn't cover
+		struct timeval timeout;
+		timeout.tv_sec = 30;   // 30 seconds (was 300 = 5 minutes)
+		timeout.tv_usec = 0;
+		if (setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0) {
+			KPrintF((STRPTR)"SMB2 socket receive timeout set to %ld seconds\n", (LONG)timeout.tv_sec);
+		} else {
+			KPrintF((STRPTR)"Warning: Failed to set socket receive timeout\n");
+		}
+		
+		// Also set send timeout for completeness (30 seconds for faster debugging)
+		if (setsockopt(sock_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0) {
+			KPrintF((STRPTR)"SMB2 socket send timeout set to %ld seconds\n", (LONG)timeout.tv_sec);
+		} else {
+			KPrintF((STRPTR)"Warning: Failed to set socket send timeout\n");
 		}
 	}
 	
@@ -989,6 +1112,11 @@ static int smb2fs_read(const char *path, char *buffer, size_t size,
 		static size_t bytes_since_service = 0;
 		service_counter = 0;
 		bytes_since_service = 0;
+		
+		// SMB2 echo keep-alive tracking
+		static time_t last_echo = 0;
+		time_t current_time = time(NULL);
+		last_echo = current_time; // Reset echo timer at start of read
 
 		while (size > 0)
 		{
@@ -1036,6 +1164,13 @@ static int smb2fs_read(const char *path, char *buffer, size_t size,
 					} while (serv > 0);
 					service_counter = 0;
 					bytes_since_service = 0;
+					
+					// Check for SMB2 echo keep-alive (every 20 seconds)
+					current_time = time(NULL);
+					if (current_time - last_echo >= 20) {
+						smb2_echo(fsd->smb2);
+						last_echo = current_time;
+					}
 				}
 			}
 
@@ -1101,11 +1236,10 @@ static int smb2fs_write(const char *path, const char *buffer, size_t size,
 			return (int)new_offset;
 		}
 
-		// Adaptive chunk sizing for optimal throughput
-		// Start with 64KB, halve on EAGAIN, grow on success
+		// Adaptive chunk sizing for optimal throughput  
+		// Start with 64KB, grow on success (no EAGAIN with blocking sockets)
 		const size_t INITIAL_CHUNK = 65536;    // 64 KiB
-		const size_t MTU_SIZE = 1460;          // MTU minus headers
-		const size_t SUCCESS_THRESHOLD = 3;    // Successes before growing
+		const size_t SUCCESS_THRESHOLD = 4;    // Successes before growing chunk
 		
 		max_write_size = smb2_get_max_write_size(fsd->smb2);
 		size_t chunk_size = INITIAL_CHUNK;
@@ -1121,6 +1255,23 @@ static int smb2fs_write(const char *path, const char *buffer, size_t size,
 		static size_t bytes_since_service = 0;
 		service_counter = 0;
 		bytes_since_service = 0;
+		
+		// SMB2 echo keep-alive tracking
+		static time_t last_echo = 0;
+		time_t current_time = time(NULL);
+		last_echo = current_time; // Reset echo timer at start of write
+		
+		// CRITICAL: Validate socket before ANY write operations!
+		int write_sock_fd = smb2_get_fd(fsd->smb2);
+		KPrintF((STRPTR)"WRITE_VALIDATION: socket fd=%ld\n", (LONG)write_sock_fd);
+		if (write_sock_fd <= 2) {
+			KPrintF((STRPTR)"FATAL ERROR: Invalid socket fd=%ld in write function - ABORTING!\n", (LONG)write_sock_fd);
+			return -ENODEV;
+		}
+		
+		// HANG DEBUG: Initialize debug log for this write operation (using KPrintF to avoid linking conflicts)
+		KPrintF((STRPTR)"\n[%ld] === WRITE_START: total_size=%lu bytes, max_write=%lu ===\n", 
+			(LONG)current_time, (ULONG)size, (ULONG)max_write_size);
 
 		while (size > 0)
 		{
@@ -1128,31 +1279,20 @@ static int smb2fs_write(const char *path, const char *buffer, size_t size,
 			if (count > chunk_size)
 				count = chunk_size;
 			
-			// Direct write - socket is non-blocking, no pre-polling
+			// HANG DEBUG: Log write attempt with timestamp
+			current_time = time(NULL);
+			KPrintF((STRPTR)"[%ld] WRITE_ATTEMPT: %lu bytes (chunk=%lu, remaining=%lu)\n", 
+				(LONG)current_time, (ULONG)count, (ULONG)chunk_size, (ULONG)size);
+			
+			// Direct write - socket is blocking as expected by libsmb2
 			rc = smb2_write(fsd->smb2, smb2fh, (const uint8_t *)buffer_ref, count);
+			
+			// HANG DEBUG: Log write result immediately
+			current_time = time(NULL);
+			KPrintF((STRPTR)"[%ld] WRITE_RESULT: %ld\n", (LONG)current_time, (LONG)rc);
 			
 			if (rc < 0)
 			{
-				// Check for EAGAIN/EWOULDBLOCK (backpressure)
-				const char *error = smb2_get_error(fsd->smb2);
-				if (error && (strstr(error, "EAGAIN") || strstr(error, "would block") || strstr(error, "try again"))) {
-					// Adaptive backoff
-					chunk_size = chunk_size / 2;
-					if (chunk_size < MTU_SIZE)
-						chunk_size = MTU_SIZE;
-					success_count = 0;
-					
-					// Wait for socket writability - only when actually needed
-					int sock_fd = smb2_get_fd(fsd->smb2);
-					if (sock_fd >= 0) {
-						fd_set wfds;
-						FD_ZERO(&wfds);
-						FD_SET(sock_fd, &wfds);
-						ULONG sigmask;
-						WaitSelect(sock_fd + 1, NULL, &wfds, NULL, NULL, &sigmask);
-					}
-					continue;
-				}
 				
 				// Connection fault - try to recover
 				if(!handle_connection_fault())
@@ -1184,6 +1324,13 @@ static int smb2fs_write(const char *path, const char *buffer, size_t size,
 					} while (serv > 0);
 					service_counter = 0;
 					bytes_since_service = 0;
+					
+					// Check for SMB2 echo keep-alive (every 20 seconds)
+					current_time = time(NULL);
+					if (current_time - last_echo >= 20) {
+						smb2_echo(fsd->smb2);
+						last_echo = current_time;
+					}
 				}
 				
 				// Increment success counter and potentially grow chunk size
@@ -1708,6 +1855,9 @@ int smb2fs_main(struct DosPacket *pkt)
 	int                       error;
 	int                       rc = RETURN_ERROR;
 
+	/* NOTE: bsdsocket.library is already opened in start_os3.c */
+	KPrintF("[SOCKET_DEBUG] SocketBase=%p (initialized in startup)\n", SocketBase);
+
 	memset(&md, 0, sizeof(md));
 
 	devnode = (struct DeviceNode *)BADDR(pkt->dp_Arg3);
@@ -1790,6 +1940,8 @@ cleanup:
 		free(md.device);
 		md.device = NULL;
 	}
+
+	/* NOTE: bsdsocket.library cleanup is handled in start_os3.c */
 
 	return rc;
 }

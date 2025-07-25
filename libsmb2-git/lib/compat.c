@@ -73,6 +73,7 @@ int gethostname(char *name, size_t len)
 #define NEED_READV
 #define NEED_WRITEV
 #include <proto/bsdsocket.h>
+#include <clib/debug_protos.h>
 #define read(fd, buf, count) recv(fd, buf, count, 0)
 #define write(fd, buf, count) send(fd, buf, count, 0)
 #ifdef libnix
@@ -305,9 +306,27 @@ int smb2_getaddrinfo(const char *node, const char*service,
         *res = malloc(sizeof(struct addrinfo));
         memset(*res, 0, sizeof(struct addrinfo));
 #endif
-        (*res)->ai_family = AF_INET;
-        (*res)->ai_addrlen = sizeof(struct sockaddr_in);
-        (*res)->ai_addr = (struct sockaddr *)sin;
+        	/* CRITICAL: BYPASS CORRUPTED GETADDRINFO - Use Direct Socket Approach */
+	/* Based on working Squirt AmigaOS implementation that proves TCP sockets work */
+	/* Assignments to addrinfo struct fail completely due to ABI/layout corruption */
+	
+	KPrintF("[DIRECT_SOCKET] BYPASSING corrupted getaddrinfo - using direct socket approach\n");
+	
+	/* Use hardcoded working values from Squirt reference */
+	/* These exact values work in Squirt: socket(AF_INET, SOCK_STREAM, 0) */
+	(*res)->ai_family = 2;      // AF_INET - hardcoded working value from Squirt
+	(*res)->ai_socktype = 1;    // SOCK_STREAM - hardcoded working value from Squirt  
+	(*res)->ai_protocol = 0;    // Protocol 0 works in Squirt (let kernel choose TCP)
+	(*res)->ai_addrlen = sizeof(struct sockaddr_in);
+	(*res)->ai_addr = (struct sockaddr *)sin;
+
+	/* Force memory barrier to ensure assignments stick */
+	__asm__ __volatile__("" ::: "memory");
+	
+	KPrintF("[DIRECT_SOCKET] Set values: ai_family=%d, ai_socktype=%d, ai_protocol=%d\n", 
+		(*res)->ai_family, (*res)->ai_socktype, (*res)->ai_protocol);
+	KPrintF("[DIRECT_SOCKET] AmigaOS constants: AF_INET=%d, SOCK_STREAM=%d, IPPROTO_TCP=%d\n", 
+		AF_INET, SOCK_STREAM, IPPROTO_TCP);
 
         return 0;
 }
@@ -400,6 +419,38 @@ ssize_t writev(t_socket fd, const struct iovec* vector, int count)
                 if (to_copy == 0)
                         break;
         }
+        
+        /* CRITICAL SMB2 PACKET DEBUGGING: Capture malformed packet bytes */
+        if (bytes >= 4) {
+                /* Check if this looks like an SMB2 packet (starts with 0xFE 'SMB') */
+                unsigned char *pkt = (unsigned char *)buffer;
+                if (pkt[0] == 0xFE && pkt[1] == 'S' && pkt[2] == 'M' && pkt[3] == 'B') {
+                        KPrintF("[SMB2_PKT_DEBUG] === SMB2 PACKET SEND ===\n");
+                        KPrintF("[SMB2_PKT_DEBUG] Socket fd=%d, Packet size=%zu bytes\n", (int)fd, bytes);
+                        
+                        /* Dump SMB2 header (first 64 bytes) in hex */
+                        KPrintF("[SMB2_PKT_DEBUG] SMB2 Header Hex: ");
+                        for (i = 0; i < (bytes < 64 ? bytes : 64); i++) {
+                                KPrintF("%02X ", pkt[i]);
+                                if ((i + 1) % 16 == 0) KPrintF("\n[SMB2_PKT_DEBUG]                   ");
+                        }
+                        KPrintF("\n");
+                        
+                        /* Extract key SMB2 header fields for diagnosis */
+                        if (bytes >= 16) {
+                                unsigned short cmd = (pkt[12] | (pkt[13] << 8));
+                                unsigned int status = (pkt[8] | (pkt[9] << 8) | (pkt[10] << 16) | (pkt[11] << 24));
+                                KPrintF("[SMB2_PKT_DEBUG] SMB2 Command: 0x%04X, Status: 0x%08X\n", cmd, status);
+                                
+                                /* Check for the problematic 0x0005 command */
+                                if (cmd == 0x0005) {
+                                        KPrintF("[SMB2_PKT_DEBUG] *** DETECTED COMMAND 0x0005 (TREE_CONNECT) - THIS MAY BE THE MALFORMED PACKET! ***\n");
+                                }
+                        }
+                        KPrintF("[SMB2_PKT_DEBUG] ========================\n");
+                }
+        }
+        
         bytes_written = write((int)fd, buffer, bytes);
         free(buffer);
         return bytes_written;

@@ -26,6 +26,9 @@
 #include <proto/bsdsocket.h>
 #include <SDI/SDI_compiler.h>
 #include <errno.h>
+#ifndef __amigaos4__
+#include <clib/debug_protos.h>
+#endif
 
 struct ExecBase *SysBase;
 struct DosLibrary *DOSBase;

@@ -60,6 +60,10 @@
 #include <errno.h>
 #include <stdio.h>
 
+#ifndef __amigaos4__
+#include <clib/debug_protos.h>
+#endif
+
 #ifdef HAVE_SYS_POLL_H
 #include <sys/poll.h>
 #endif
@@ -1054,9 +1058,80 @@ smb2_connect_share_async(struct smb2_context *smb2,
         struct connect_data *c_data;
         int err;
 
+        KPrintF("[EARLY_DEBUG] === smb2_connect_share_async ENTRY ===\n");
+        KPrintF("[EARLY_DEBUG] smb2=%p, server=%s, share=%s, user=%s\n", 
+               smb2, server ? server : "(null)", share ? share : "(null)", user ? user : "(null)");
+
+        KPrintF("[ENCODING_FIX] Checking for character encoding corruption...\n");
+	
+	// Check if parameters contain UTF-16/wide character patterns (alternating null bytes)
+	const char *fixed_server = server;
+	const char *fixed_share = share;
+	const char *fixed_user = user;
+	
+	if (server && ((unsigned long)server > 0x1000 && (unsigned long)server < 0x80000000)) {
+		unsigned char *bytes = (unsigned char*)server;
+		// Check for UTF-16 pattern: alternating null bytes
+		if (bytes[0] == 0x00 && bytes[2] == 0x00 && bytes[1] != 0x00 && bytes[3] != 0x00) {
+			KPrintF("[ENCODING_FIX] UTF-16 corruption detected in server parameter\n");
+			// Convert UTF-16 to ASCII by extracting every other byte
+			static char server_fixed[256];
+			int i, j = 0;
+			for (i = 1; i < 255 && j < 127 && bytes[i] != 0; i += 2) {
+				server_fixed[j++] = bytes[i];
+				if (bytes[i+1] == 0 && bytes[i+2] == 0) break; // End of string
+			}
+			server_fixed[j] = '\0';
+			fixed_server = server_fixed;
+			KPrintF("[ENCODING_FIX] Converted server: %s\n", fixed_server);
+		}
+	}
+	
+	if (share && ((unsigned long)share > 0x1000 && (unsigned long)share < 0x80000000)) {
+		unsigned char *bytes = (unsigned char*)share;
+		if (bytes[0] == 0x00 && bytes[2] == 0x00 && bytes[1] != 0x00 && bytes[3] != 0x00) {
+			KPrintF("[ENCODING_FIX] UTF-16 corruption detected in share parameter\n");
+			static char share_fixed[256];
+			int i, j = 0;
+			for (i = 1; i < 255 && j < 127 && bytes[i] != 0; i += 2) {
+				share_fixed[j++] = bytes[i];
+				if (bytes[i+1] == 0 && bytes[i+2] == 0) break;
+			}
+			share_fixed[j] = '\0';
+			fixed_share = share_fixed;
+			KPrintF("[ENCODING_FIX] Converted share: %s\n", fixed_share);
+		}
+	}
+	
+	if (user && ((unsigned long)user > 0x1000 && (unsigned long)user < 0x80000000)) {
+		unsigned char *bytes = (unsigned char*)user;
+		if (bytes[0] == 0x00 && bytes[2] == 0x00 && bytes[1] != 0x00 && bytes[3] != 0x00) {
+			KPrintF("[ENCODING_FIX] UTF-16 corruption detected in user parameter\n");
+			static char user_fixed[256];
+			int i, j = 0;
+			for (i = 1; i < 255 && j < 127 && bytes[i] != 0; i += 2) {
+				user_fixed[j++] = bytes[i];
+				if (bytes[i+1] == 0 && bytes[i+2] == 0) break;
+			}
+			user_fixed[j] = '\0';
+			fixed_user = user_fixed;
+			KPrintF("[ENCODING_FIX] Converted user: %s\n", fixed_user);
+		}
+	}
+	
+	// Update parameters with fixed values
+	server = fixed_server;
+	share = fixed_share;
+	user = fixed_user;
+	
+	KPrintF("[ENCODING_FIX] Final parameters: server=%s, share=%s, user=%s\n", 
+		server ? server : "(null)", share ? share : "(null)", user ? user : "(null)");
+
         if (smb2 == NULL) {
+                KPrintF("[EARLY_DEBUG] ERROR: smb2 context is NULL!\n");
                 return -EINVAL;
         }
+        KPrintF("[EARLY_DEBUG] smb2 context validation passed\n");
 
         if (smb2->server != NULL) {
                 free(discard_const(smb2->server));
@@ -1131,11 +1206,15 @@ smb2_connect_share_async(struct smb2_context *smb2,
         c_data->cb = cb;
         c_data->cb_data = cb_data;
 
+        KPrintF("[EARLY_DEBUG] About to call smb2_connect_async()...\n");
         err = smb2_connect_async(smb2, server, connect_cb, c_data);
+        KPrintF("[EARLY_DEBUG] smb2_connect_async() returned: %d\n", err);
         if (err != 0) {
+                KPrintF("[EARLY_DEBUG] ERROR: smb2_connect_async failed with %d\n", err);
                 free_c_data(smb2, c_data);
                 return err;
         }
+        KPrintF("[EARLY_DEBUG] smb2_connect_share_async() completing successfully\n");
 
         return 0;
 }
